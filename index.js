@@ -59,7 +59,3 @@ app.get("/vedtatt", async (req, res) => {
     res.status(500).json({ error: "Database error" });
   }
 });
-
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
