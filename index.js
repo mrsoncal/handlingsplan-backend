@@ -25,8 +25,8 @@ const pool = new Pool({
   keepAlive: true,
 });
 
+// ---- Auth middleware
 function auth(req, res, next) {
-  // Optional: require admin for writes
   const hdr = req.headers.authorization || "";
   const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : null;
   if (!token) return res.status(401).json({ message: "Missing token" });
@@ -39,6 +39,7 @@ function auth(req, res, next) {
   }
 }
 
+// ---- Login route
 app.post("/login", (req, res) => {
   const { password } = req.body;
   if (password !== process.env.ADMIN_PASSWORD) {
@@ -48,10 +49,39 @@ app.post("/login", (req, res) => {
   res.json({ token });
 });
 
-// ---- Save vedtatt (now uses suggestion_id). Back-compat: accept rowId too.
+// ---- TEMP: one-time protected route to DROP + CREATE table
+// Call once from your browser console, then remove this block and redeploy.
+app.post("/admin/recreate-vedtatt", async (req, res) => {
+  const pass = req.headers["x-admin-password"];
+  if (pass !== process.env.ADMIN_PASSWORD) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
+    console.log("🧨 Dropping existing vedtatt_status table...");
+    await pool.query(`DROP TABLE IF EXISTS vedtatt_status;`);
+
+    console.log("🧱 Creating fresh vedtatt_status table...");
+    await pool.query(`
+      CREATE TABLE vedtatt_status (
+        suggestion_id TEXT PRIMARY KEY,
+        vedtatt BOOLEAN NOT NULL DEFAULT FALSE,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    console.log("✅ vedtatt_status table recreated successfully.");
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("❌ recreate-vedtatt error:", e);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// ---- Save vedtatt (now uses suggestion_id)
 app.post("/vedtatt", /* auth, */ async (req, res) => {
   const { suggestionId, vedtatt, rowId } = req.body;
-  const key = suggestionId ?? rowId; // support old clients briefly
+  const key = suggestionId ?? rowId;
   if (!key || typeof vedtatt !== "boolean") {
     return res.status(400).json({ error: "Missing suggestionId/vedtatt" });
   }
@@ -59,7 +89,8 @@ app.post("/vedtatt", /* auth, */ async (req, res) => {
     await pool.query(
       `INSERT INTO vedtatt_status (suggestion_id, vedtatt)
        VALUES ($1, $2)
-       ON CONFLICT (suggestion_id) DO UPDATE SET vedtatt = EXCLUDED.vedtatt, updated_at = NOW()`,
+       ON CONFLICT (suggestion_id) DO UPDATE
+       SET vedtatt = EXCLUDED.vedtatt, updated_at = NOW()`,
       [key, vedtatt]
     );
     res.json({ success: true });
@@ -69,7 +100,7 @@ app.post("/vedtatt", /* auth, */ async (req, res) => {
   }
 });
 
-// ---- Load states; never 500 the client on transient DB errors
+// ---- Load states
 app.get("/vedtatt", async (req, res) => {
   try {
     const result = await pool.query("SELECT suggestion_id, vedtatt FROM vedtatt_status");
@@ -77,7 +108,6 @@ app.get("/vedtatt", async (req, res) => {
     res.json(map);
   } catch (err) {
     console.error("Error loading vedtatt states:", err);
-    // graceful fallback so the UI still loads
     res.status(200).json({});
   }
 });
@@ -85,4 +115,3 @@ app.get("/vedtatt", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
-
