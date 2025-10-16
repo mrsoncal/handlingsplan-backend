@@ -52,6 +52,20 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
 
+// -------------------- Simple login route --------------------
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "default123";
+
+app.post("/login", (req, res) => {
+  const { password } = req.body || {};
+  if (password === ADMIN_PASSWORD) {
+    // you can later replace token with a signed JWT if needed
+    res.json({ success: true, token: "admin-token" });
+  } else {
+    res.status(401).json({ success: false, error: "Invalid password" });
+  }
+});
+
+
 // =====================================================================
 //                         Suggestions API
 //  Table expected (from migration):
