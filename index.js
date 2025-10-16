@@ -194,19 +194,7 @@ app.patch("/api/suggestions/:id", async (req, res) => {
   let sql = `UPDATE suggestions
              SET ${sets.join(", ")}, updated_at = NOW(), updated_by = $${updatedByIndex}
              WHERE suggestion_id = $${idIndex}`;
-
-  // Optional optimistic lock
-  if (expectedUpdatedAt) {
-    try {
-      const iso = new Date(expectedUpdatedAt).toISOString();
-      values.push(iso);
-      const lockIndex = ++i;
-      sql += ` AND updated_at = $${lockIndex}`;
-    } catch {
-      return res.status(400).json({ error: "Invalid expectedUpdatedAt" });
-    }
-  }
-
+             
   sql += " RETURNING suggestion_id, status, payload, created_at, updated_at, updated_by";
 
   try {
