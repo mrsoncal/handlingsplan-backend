@@ -1,10 +1,10 @@
-// index.js
+// index.js — Real-time suggestions API (id-keyed + deltas + optimistic lock)
 import express from "express";
 import cors from "cors";
 import pkg from "pg";
 const { Pool } = pkg;
 
-// ---------- Config ----------
+// -------------------- Config --------------------
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -14,9 +14,9 @@ if (!DATABASE_URL) {
 }
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-// Allow your GitHub Pages (or set ALLOWED_ORIGIN env). Fallback: allow all for now.
+// Allow your GitHub Pages (or set ALLOWED_ORIGIN). Fallback: allow all.
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
 app.use(
   cors({
@@ -26,13 +26,12 @@ app.use(
   })
 );
 
-// ---------- PG Pool ----------
+// -------------------- PG Pool --------------------
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Render PG usually needs SSL
+  ssl: { rejectUnauthorized: false },
 });
 
-// Small helper with retry to avoid transient disconnects
 async function queryWithRetry(text, params = [], tries = 2) {
   try {
     return await pool.query(text, params);
@@ -45,153 +44,176 @@ async function queryWithRetry(text, params = [], tries = 2) {
   }
 }
 
-// ---------- Health check ----------
+// -------------------- Health --------------------
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, now: new Date().toISOString() });
+});
 app.get("/health", (_req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
 
 // =====================================================================
-//                          SSE + LISTEN bridge
+//                         Suggestions API
+//  Table expected (from migration):
+//   suggestions(
+//     suggestion_id TEXT PRIMARY KEY,
+//     status TEXT NOT NULL DEFAULT 'ny',
+//     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+//     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//     updated_by TEXT
+//   )
 // =====================================================================
-import { Router } from "express";
 
-const sseRouter = Router();
-const sseClients = new Set();
+// 1) Upsert a batch (idempotent).
+// Body: { items: [{ suggestion_id, status?, payload?, updated_by? }, ...] }
+app.post("/api/suggestions/upsert", async (req, res) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (!items.length) return res.status(400).json({ error: "No items" });
 
-/**
- * Browsers connect here and stay connected.
- * We broadcast DB NOTIFY payloads to all connected clients.
- */
-sseRouter.get("/events", (req, res) => {
-  res.set({
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no", // avoid proxy buffering
-  });
-  res.flushHeaders();
-
-  // initial ping (optional)
-  res.write(`event: ping\ndata: "connected"\n\n`);
-
-  sseClients.add(res);
-  req.on("close", () => {
-    sseClients.delete(res);
-  });
-});
-
-app.use("/sse", sseRouter);
-
-// Dedicated LISTEN client (do not return it to the pool)
-(async () => {
+  const client = await pool.connect();
   try {
-    const listenClient = await pool.connect();
-    await listenClient.query("LISTEN suggestions_changes");
+    await client.query("BEGIN");
+    for (const raw of items) {
+      const {
+        suggestion_id,
+        status = "ny",
+        payload = {},
+        updated_by = null,
+      } = raw || {};
 
-    listenClient.on("notification", (msg) => {
-      // Fan out the raw payload to all connected SSE clients
-      for (const res of sseClients) {
-        res.write(`event: dbchange\ndata: ${msg.payload}\n\n`);
+      if (!suggestion_id) {
+        throw new Error("suggestion_id missing in one of the items");
       }
-    });
 
-    listenClient.on("error", (err) => {
-      console.error("LISTEN client error:", err);
-    });
-
-    console.log("✅ LISTEN on channel: suggestions_changes");
-  } catch (err) {
-    console.error("❌ Failed to start LISTEN:", err);
+      await client.query(
+        `INSERT INTO suggestions (suggestion_id, status, payload, updated_by)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (suggestion_id) DO UPDATE
+         SET status = EXCLUDED.status,
+             payload = EXCLUDED.payload,
+             updated_by = EXCLUDED.updated_by,
+             updated_at = NOW()`,
+        [suggestion_id, status, payload, updated_by]
+      );
+    }
+    await client.query("COMMIT");
+    res.json({ ok: true, count: items.length });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("POST /api/suggestions/upsert error:", e);
+    res.status(500).json({ error: e.message || "Database error" });
+  } finally {
+    client.release();
   }
-})();
+});
 
-// =====================================================================
-//                    Minimal vedtatt endpoints (adjust as needed)
-// =====================================================================
+// 2) Delta fetch — return items updated since a given ISO timestamp.
+// Query params: since?=ISO, status?=string, limit?=int
+app.get("/api/suggestions", async (req, res) => {
+  const { since, status, limit = 500 } = req.query;
 
-/**
- * Return all vedtatt rows (adjust ordering/columns to your needs)
- */
-app.get("/vedtatt", async (_req, res) => {
+  const params = [];
+  const where = [];
+
+  if (since) {
+    try {
+      const iso = new Date(since).toISOString();
+      params.push(iso);
+      where.push(`updated_at > $${params.length}`);
+    } catch {
+      return res.status(400).json({ error: "Invalid 'since' timestamp" });
+    }
+  }
+
+  if (status) {
+    params.push(status);
+    where.push(`status = $${params.length}`);
+  }
+
+  const sql = `SELECT suggestion_id, status, payload, created_at, updated_at, updated_by
+               FROM suggestions
+               ${where.length ? "WHERE " + where.join(" AND ") : ""}
+               ORDER BY updated_at ASC
+               LIMIT ${Number(limit)}`;
+
   try {
-    const r = await queryWithRetry(
-      `SELECT suggestion_id, vedtatt, updated_at
-       FROM public.vedtatt_status
-       ORDER BY updated_at DESC NULLS LAST`
-    );
-    res.json(r.rows);
-  } catch (err) {
-    console.error("GET /vedtatt error:", err);
+    const { rows } = await queryWithRetry(sql, params);
+    res.json({ items: rows, serverTime: new Date().toISOString() });
+  } catch (e) {
+    console.error("GET /api/suggestions error:", e);
     res.status(500).json({ error: "Database error" });
   }
 });
 
-/**
- * Fetch a single row by suggestion_id (text) — used by the client after SSE ping
- */
-app.get("/vedtatt/:suggestionId", async (req, res) => {
-  const id = req.params.suggestionId;
+// 3) Update one suggestion with optimistic locking.
+// Body: { status?, payload?, expectedUpdatedAt?: ISO, actor?: string }
+app.patch("/api/suggestions/:id", async (req, res) => {
+  const { id } = req.params;
+  const { status, payload, expectedUpdatedAt, actor } = req.body || {};
+
+  if (typeof status === "undefined" && typeof payload === "undefined") {
+    return res.status(400).json({ error: "Nothing to update (status or payload required)" });
+  }
+
+  // Build dynamic SET list
+  const sets = [];
+  const values = [];
+  let i = 0;
+
+  if (typeof status !== "undefined") {
+    values.push(status);
+    sets.push(`status = $${++i}`);
+  }
+  if (typeof payload !== "undefined") {
+    values.push(payload);
+    sets.push(`payload = $${++i}`);
+  }
+
+  // actor goes into updated_by
+  values.push(actor || null);
+  const updatedByIndex = ++i;
+
+  values.push(id);
+  const idIndex = ++i;
+
+  let sql = `UPDATE suggestions
+             SET ${sets.join(", ")}, updated_at = NOW(), updated_by = $${updatedByIndex}
+             WHERE suggestion_id = $${idIndex}`;
+
+  // Optional optimistic lock
+  if (expectedUpdatedAt) {
+    try {
+      const iso = new Date(expectedUpdatedAt).toISOString();
+      values.push(iso);
+      const lockIndex = ++i;
+      sql += ` AND updated_at = $${lockIndex}`;
+    } catch {
+      return res.status(400).json({ error: "Invalid expectedUpdatedAt" });
+    }
+  }
+
+  sql += " RETURNING suggestion_id, status, payload, created_at, updated_at, updated_by";
+
   try {
-    const r = await queryWithRetry(
-      `SELECT suggestion_id, vedtatt, updated_at
-       FROM public.vedtatt_status
-       WHERE suggestion_id = $1`,
-      [id]
-    );
-    if (r.rows.length === 0) return res.status(404).json({ error: "Not found" });
-    res.json(r.rows[0]);
-  } catch (err) {
-    console.error("GET /vedtatt/:suggestionId error:", err);
+    const { rows } = await queryWithRetry(sql, values);
+    if (!rows.length) {
+      return res.status(409).json({ error: "Version conflict or not found" });
+    }
+    res.json({ item: rows[0] });
+  } catch (e) {
+    console.error("PATCH /api/suggestions/:id error:", e);
     res.status(500).json({ error: "Database error" });
   }
 });
 
-/**
- * Upsert / toggle vedtatt (example). If your app posts differently, adjust this handler.
- * Body: { suggestion_id: string, vedtatt: boolean }
- */
-app.post("/vedtatt", async (req, res) => {
-  const { suggestion_id, vedtatt } = req.body || {};
-  if (!suggestion_id || typeof vedtatt !== "boolean") {
-    return res.status(400).json({ error: "Missing suggestion_id or vedtatt" });
-  }
-  try {
-    const r = await queryWithRetry(
-      `INSERT INTO public.vedtatt_status (suggestion_id, vedtatt, updated_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (suggestion_id)
-       DO UPDATE SET vedtatt = EXCLUDED.vedtatt, updated_at = NOW()
-       RETURNING suggestion_id, vedtatt, updated_at`,
-      [suggestion_id, vedtatt]
-    );
-    res.json(r.rows[0]);
-    // The DB trigger will emit NOTIFY automatically after this INSERT/UPDATE
-  } catch (err) {
-    console.error("POST /vedtatt error:", err);
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
 // =====================================================================
-//                     (Optional) Login route placeholder
-// =====================================================================
-// If you already have /login in your previous file, keep it.
-// Here’s a tiny placeholder to avoid breaking callers:
-app.post("/login", async (_req, res) => {
-  // Implement your real login here or keep your old code.
-  res.json({ ok: true });
-});
-
-// =====================================================================
-//                       Graceful shutdown
+//                        Graceful shutdown
 // =====================================================================
 function shutdown(signal) {
-  console.log(`\n${signal} received, shutting down…`);
+  console.log(`\\n${signal} received, shutting down…`);
   app.close?.();
-  // Close SSE clients
-  for (const res of sseClients) {
-    try { res.end(); } catch {}
-  }
+
   pool
     .end()
     .then(() => {
@@ -206,8 +228,26 @@ function shutdown(signal) {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-// ---------- Start server ----------
+// -------------------- Start server --------------------
 app.listen(PORT, () => {
-  console.log(`🚀 Server listening on port ${PORT}`);
-  console.log(`SSE endpoint: /sse/events`);
+  console.log(`🚀 API listening on port ${PORT}`);
+  console.log(`Health:        GET /api/health`);
+  console.log(`Upsert batch:  POST /api/suggestions/upsert`);
+  console.log(`Delta fetch:   GET  /api/suggestions?since=ISO&status=...`);
+  console.log(`Update one:    PATCH /api/suggestions/:id`);
 });
+
+/* ---------------------------------------------------------------------
+ Optional: SSE for instant updates later.
+ You can wire PostgreSQL NOTIFY/LISTEN to broadcast to clients instead of polling.
+
+ Example DB trigger (run in SQL, not JS):
+   PERFORM pg_notify('suggestions_changes', row_to_json(NEW)::text);
+
+ And in Node, open a dedicated client:
+   const listenClient = await pool.connect();
+   await listenClient.query("LISTEN suggestions_changes");
+   listenClient.on("notification", (msg) => { /* fan out via res.write() * / });
+
+ Then expose GET /api/suggestions/stream as an EventSource.
+--------------------------------------------------------------------- */
