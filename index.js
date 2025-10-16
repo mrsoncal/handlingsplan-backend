@@ -2,7 +2,6 @@
 import express from "express";
 import cors from "cors";
 import pkg from "pg";
-import { sseRouter } from "./sse.js";
 const { Pool } = pkg;
 
 // ---------- Config ----------
@@ -206,8 +205,6 @@ function shutdown(signal) {
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
-
-app.use("/sse", sseRouter);
 
 // ---------- Start server ----------
 app.listen(PORT, () => {
