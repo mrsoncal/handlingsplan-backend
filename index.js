@@ -125,6 +125,11 @@ app.post("/api/suggestions/upsert", async (req, res) => {
 // 2) Delta fetch — return items updated since a given ISO timestamp.
 // Query params: since?=ISO, status?=string, limit?=int
 app.get("/api/suggestions", async (req, res) => {
+  // 🚫 Prevent caching (so all clients always see the newest data)
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+
   const { since, status, limit = 500 } = req.query;
 
   const params = [];
