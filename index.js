@@ -91,7 +91,7 @@ app.post("/api/suggestions/upsert", async (req, res) => {
     for (const raw of items) {
       const {
         suggestion_id,
-        status = "ny",
+        status,
         payload = {},
         updated_by = null,
       } = raw || {};
@@ -102,9 +102,9 @@ app.post("/api/suggestions/upsert", async (req, res) => {
 
       await client.query(
           `INSERT INTO suggestions (suggestion_id, status, payload, updated_by)
-          VALUES ($1, $2, $3, $4)
+          VALUES ($1, COALESCE($2, 'ny'), $3, $4)  -- ✅ only defaults on true insert
           ON CONFLICT (suggestion_id) DO UPDATE
-          SET status     = COALESCE(EXCLUDED.status, suggestions.status), -- keep existing if null/omitted
+          SET status     = COALESCE(EXCLUDED.status, suggestions.status),  -- ✅ keep if not provided
               payload    = EXCLUDED.payload,
               updated_by = EXCLUDED.updated_by,
               updated_at = NOW()`,
