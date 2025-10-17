@@ -101,13 +101,13 @@ app.post("/api/suggestions/upsert", async (req, res) => {
       }
 
       await client.query(
-        `INSERT INTO suggestions (suggestion_id, status, payload, updated_by)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (suggestion_id) DO UPDATE
-         SET status = EXCLUDED.status,
-             payload = EXCLUDED.payload,
-             updated_by = EXCLUDED.updated_by,
-             updated_at = NOW()`,
+          `INSERT INTO suggestions (suggestion_id, status, payload, updated_by)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT (suggestion_id) DO UPDATE
+          SET status     = COALESCE(EXCLUDED.status, suggestions.status), -- keep existing if null/omitted
+              payload    = EXCLUDED.payload,
+              updated_by = EXCLUDED.updated_by,
+              updated_at = NOW()`,
         [suggestion_id, status, payload, updated_by]
       );
     }
