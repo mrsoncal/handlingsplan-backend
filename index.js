@@ -209,6 +209,20 @@ app.patch("/api/suggestions/:id", async (req, res) => {
   }
 });
 
+// 4) Delete one suggestion by id
+app.delete("/api/suggestions/:id", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rowCount } = await queryWithRetry("DELETE FROM suggestions WHERE suggestion_id = $1", [id]);
+    if (rowCount === 0) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true, deleted: id });
+  } catch (e) {
+    console.error("DELETE /api/suggestions/:id error:", e);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+
 // =====================================================================
 //                        Graceful shutdown
 // =====================================================================
